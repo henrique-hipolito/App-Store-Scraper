@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  polymarket-bot:
+    build: .
+    container_name: polymarket-monitor
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=8548140243:AAGuAeBCXsxqE0xWAG869fRUlhcdEs-O8io
+      - TELEGRAM_CHAT_ID=637550079
+      - CHECK_INTERVAL=60
+      - TOP_APPS_LIMIT=10
+      - POSITION_CHANGE_THRESHOLD=3
+    # Para logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
