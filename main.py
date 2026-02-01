@@ -33,6 +33,9 @@ TOP_APPS_LIMIT = int(os.getenv("TOP_APPS_LIMIT", "10"))
 # Alertar quando app subir X posições de uma vez (para apps fora do top 3)
 POSITION_CHANGE_THRESHOLD = int(os.getenv("POSITION_CHANGE_THRESHOLD", "3"))
 
+# Intervalo do heartbeat em segundos (padrão: 6 horas = 21600)
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "21600"))
+
 # ============== ESTRUTURAS DE DADOS ==============
 @dataclass
 class AppRanking:
@@ -54,9 +57,10 @@ class RankingChange:
 
 # ============== POLYMARKET LINK ==============
 class PolymarketLink:
-    """Gera o link dinâmico do Polymarket baseado na próxima sexta-feira"""
+    """Gera os links dinâmicos do Polymarket baseado na próxima sexta-feira"""
     
-    BASE_URL = "https://polymarket.com/event/1-free-app-in-the-us-apple-app-store-on-{month}-{day}"
+    BASE_URL_1 = "https://polymarket.com/event/1-free-app-in-the-us-apple-app-store-on-{month}-{day}"
+    BASE_URL_2 = "https://polymarket.com/event/2-free-app-in-the-us-apple-app-store-on-{month}-{day}"
     ET_TIMEZONE = ZoneInfo("America/New_York")
     
     MONTHS = {
@@ -75,8 +79,8 @@ class PolymarketLink:
     }
     
     @classmethod
-    def get_current_market_link(cls) -> str:
-        """Retorna o link do mercado atual (próxima sexta ou sexta atual se antes das 12:00 ET)"""
+    def _get_target_friday(cls) -> datetime:
+        """Retorna a sexta-feira relevante para o mercado atual"""
         now_et = datetime.now(cls.ET_TIMEZONE)
         
         # Encontrar a sexta-feira relevante
@@ -86,34 +90,36 @@ class PolymarketLink:
             # Hoje é sexta
             if now_et.hour < 12:
                 # Antes do meio-dia, mercado ainda está ativo
-                target_date = now_et.date()
+                return now_et
             else:
                 # Depois do meio-dia, mercado já resolveu, mostrar próxima sexta
-                target_date = (now_et + timedelta(days=7)).date()
+                return now_et + timedelta(days=7)
         else:
             # Não é sexta, pegar a próxima
-            target_date = (now_et + timedelta(days=days_until_friday)).date()
-        
-        month_name = cls.MONTHS[target_date.month]
-        day = target_date.day
-        
-        return cls.BASE_URL.format(month=month_name, day=day)
+            return now_et + timedelta(days=days_until_friday)
+    
+    @classmethod
+    def _build_link(cls, base_url: str) -> str:
+        target = cls._get_target_friday()
+        month_name = cls.MONTHS[target.month]
+        day = target.day
+        return base_url.format(month=month_name, day=day)
+    
+    @classmethod
+    def get_top1_link(cls) -> str:
+        """Link do mercado #1 Free App"""
+        return cls._build_link(cls.BASE_URL_1)
+    
+    @classmethod
+    def get_top2_link(cls) -> str:
+        """Link do mercado #2 Free App"""
+        return cls._build_link(cls.BASE_URL_2)
     
     @classmethod
     def get_market_date_str(cls) -> str:
         """Retorna a data do mercado formatada"""
-        now_et = datetime.now(cls.ET_TIMEZONE)
-        days_until_friday = (4 - now_et.weekday()) % 7
-        
-        if days_until_friday == 0:
-            if now_et.hour < 12:
-                target_date = now_et.date()
-            else:
-                target_date = (now_et + timedelta(days=7)).date()
-        else:
-            target_date = (now_et + timedelta(days=days_until_friday)).date()
-        
-        return target_date.strftime("%d/%m/%Y")
+        target = cls._get_target_friday()
+        return target.date().strftime("%d/%m/%Y")
 
 
 # ============== SCRAPER DA APP STORE ==============
@@ -123,7 +129,7 @@ class AppStoreScraper:
     # URLs do RSS Feed da Apple (gratuito e oficial)
     RSS_URL_TEMPLATE = "https://rss.applemarketingtools.com/api/v2/{country}/apps/top-free/{limit}/apps.json"
     
-    # URL alternativa (legado, pode funcionar como backup)
+    # URL alternativa (legado)
     LEGACY_RSS_URL = "https://itunes.apple.com/{country}/rss/topfreeapplications/limit={limit}/json"
     
     def __init__(self, country: str = "us", limit: int = 25):
@@ -173,8 +179,12 @@ class AppStoreScraper:
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
                 if response.status == 200:
-                    data = await response.json()
+                    # Apple retorna content-type text/javascript, então lemos como texto e parseamos
+                    text = await response.text()
+                    data = json.loads(text)
                     return self._parse_legacy_response(data)
+                else:
+                    logger.error(f"Fallback retornou status {response.status}")
         except Exception as e:
             logger.error(f"Erro no fallback: {e}")
         
@@ -358,10 +368,27 @@ class TelegramBot:
             logger.error(f"Exceção ao enviar mensagem: {e}")
             return False
     
+    def _build_market_links(self) -> str:
+        """Monta os links do Polymarket formatados"""
+        market_date = PolymarketLink.get_market_date_str()
+        top1_link = PolymarketLink.get_top1_link()
+        top2_link = PolymarketLink.get_top2_link()
+        return (
+            f"🔗 <a href='{top1_link}'>#1 Free App ({market_date})</a>\n"
+            f"🔗 <a href='{top2_link}'>#2 Free App ({market_date})</a>"
+        )
+    
+    def _build_top5(self, top_apps: list[AppRanking]) -> str:
+        """Monta o top 5 formatado"""
+        lines = ["📊 <b>TOP 5 ATUAL:</b>"]
+        for app in top_apps[:5]:
+            prefix = "👑" if app.position == 1 else f"  #{app.position}"
+            lines.append(f"{prefix} - {app.name}")
+        return "\n".join(lines)
+    
     async def send_alert(self, changes: list[RankingChange], top_apps: list[AppRanking]):
         """Formata e envia alerta de mudanças"""
         
-        # Emojis para indicar tipo de mudança
         CROWN = "👑"
         PODIUM = "🏆"
         UP = "🚀"
@@ -401,16 +428,8 @@ class TelegramBot:
                     f"(#{change.old_position} → #{change.new_position})"
                 )
         
-        # Adicionar top 5 atual
-        lines.append("\n📊 <b>TOP 5 ATUAL:</b>")
-        for app in top_apps[:5]:
-            prefix = "👑" if app.position == 1 else f"  #{app.position}"
-            lines.append(f"{prefix} - {app.name}")
-        
-        # Link dinâmico do Polymarket
-        polymarket_link = PolymarketLink.get_current_market_link()
-        market_date = PolymarketLink.get_market_date_str()
-        lines.append(f"\n🔗 <a href='{polymarket_link}'>Polymarket ({market_date})</a>")
+        lines.append(f"\n{self._build_top5(top_apps)}")
+        lines.append(f"\n{self._build_market_links()}")
         lines.append(f"\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
         message = "\n".join(lines)
@@ -418,23 +437,31 @@ class TelegramBot:
     
     async def send_startup_message(self, top_apps: list[AppRanking]):
         """Envia mensagem de inicialização"""
-        polymarket_link = PolymarketLink.get_current_market_link()
-        market_date = PolymarketLink.get_market_date_str()
-        
         lines = [
             "🤖 <b>Bot iniciado com sucesso!</b>\n",
             f"📊 Monitorando top {len(top_apps)} apps gratuitos",
             f"⏱ Intervalo de checagem: {CHECK_INTERVAL}s",
+            f"💓 Heartbeat a cada {HEARTBEAT_INTERVAL // 3600}h",
             f"📈 Alertas: mudança de líder, entrada no top 3, subida de {POSITION_CHANGE_THRESHOLD}+ posições\n",
-            "📱 <b>TOP 5 ATUAL:</b>",
+            self._build_top5(top_apps),
+            f"\n{self._build_market_links()}",
+            f"\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         ]
         
-        for app in top_apps[:5]:
-            prefix = "👑" if app.position == 1 else f"  #{app.position}"
-            lines.append(f"{prefix} - {app.name}")
-        
-        lines.append(f"\n🔗 <a href='{polymarket_link}'>Polymarket ({market_date})</a>")
-        lines.append(f"\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        message = "\n".join(lines)
+        await self.send_message(message)
+    
+    async def send_heartbeat(self, top_apps: list[AppRanking], uptime_hours: float, checks_count: int, alerts_count: int):
+        """Envia heartbeat confirmando que o bot está vivo"""
+        lines = [
+            "💓 <b>HEARTBEAT - Bot ativo</b>\n",
+            self._build_top5(top_apps),
+            f"\n📈 Verificações: {checks_count}",
+            f"🚨 Alertas enviados: {alerts_count}",
+            f"⏱ Uptime: {uptime_hours:.1f}h",
+            f"\n{self._build_market_links()}",
+            f"\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        ]
         
         message = "\n".join(lines)
         await self.send_message(message)
@@ -449,16 +476,22 @@ class PolymarketMonitor:
         self.detector = ChangeDetector(threshold=POSITION_CHANGE_THRESHOLD)
         self.bot = TelegramBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
         self.running = False
+        self.start_time: Optional[datetime] = None
+        self.checks_count = 0
+        self.alerts_count = 0
+        self.last_successful_rankings: list[AppRanking] = []
     
     async def start(self):
         """Inicia o monitoramento"""
         logger.info("Iniciando monitor...")
         self.running = True
+        self.start_time = datetime.now()
         
         # Primeira execução
         try:
             rankings = await self.scraper.fetch_top_free_apps()
             if rankings:
+                self.last_successful_rankings = rankings
                 await self.bot.send_startup_message(rankings)
                 self.detector.detect_changes(rankings)  # Estabelece baseline
             else:
@@ -468,36 +501,70 @@ class PolymarketMonitor:
             logger.error(f"Erro na inicialização: {e}")
             return
         
-        # Loop principal
+        # Rodar loop de checagem e heartbeat em paralelo
+        await asyncio.gather(
+            self._check_loop(),
+            self._heartbeat_loop(),
+        )
+        
+        await self.cleanup()
+    
+    async def _check_loop(self):
+        """Loop principal de verificação de ranking"""
         while self.running:
             try:
                 await asyncio.sleep(CHECK_INTERVAL)
                 await self.check_once()
             except asyncio.CancelledError:
-                logger.info("Monitor cancelado")
+                logger.info("Check loop cancelado")
                 break
             except Exception as e:
-                logger.error(f"Erro no loop principal: {e}")
-                await asyncio.sleep(30)  # Espera antes de tentar novamente
-        
-        await self.cleanup()
+                logger.error(f"Erro no check loop: {e}")
+                await asyncio.sleep(30)
+    
+    async def _heartbeat_loop(self):
+        """Loop do heartbeat"""
+        while self.running:
+            try:
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                await self.send_heartbeat()
+            except asyncio.CancelledError:
+                logger.info("Heartbeat loop cancelado")
+                break
+            except Exception as e:
+                logger.error(f"Erro no heartbeat: {e}")
+                await asyncio.sleep(60)
     
     async def check_once(self):
         """Executa uma verificação única"""
         logger.info("Verificando ranking...")
+        self.checks_count += 1
         
         rankings = await self.scraper.fetch_top_free_apps()
         if not rankings:
             logger.warning("Nenhum ranking obtido")
             return
         
+        self.last_successful_rankings = rankings
         changes = self.detector.detect_changes(rankings)
         
         if changes:
+            self.alerts_count += 1
             logger.info(f"Detectadas {len(changes)} mudanças significativas!")
             await self.bot.send_alert(changes, rankings)
         else:
             logger.info(f"Nenhuma mudança significativa. Líder atual: {rankings[0].name}")
+    
+    async def send_heartbeat(self):
+        """Envia heartbeat"""
+        uptime_hours = (datetime.now() - self.start_time).total_seconds() / 3600 if self.start_time else 0
+        rankings = self.last_successful_rankings
+        
+        if rankings:
+            await self.bot.send_heartbeat(rankings, uptime_hours, self.checks_count, self.alerts_count)
+            logger.info("Heartbeat enviado")
+        else:
+            logger.warning("Sem rankings para heartbeat")
     
     async def cleanup(self):
         """Limpa recursos"""
