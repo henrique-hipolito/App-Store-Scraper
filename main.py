@@ -179,10 +179,12 @@ class Database:
             return True
         
         async with self.pool.acquire() as conn:
-            # Pegar último ranking
+            # Pegar último ranking (todos os registros do último minuto)
             rows = await conn.fetch('''
                 SELECT app_id, position FROM ranking_history 
-                WHERE timestamp = (SELECT MAX(timestamp) FROM ranking_history)
+                WHERE timestamp > NOW() - INTERVAL '2 minutes'
+                ORDER BY timestamp DESC
+                LIMIT 10
             ''')
             
             if not rows:
