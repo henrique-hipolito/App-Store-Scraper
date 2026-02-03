@@ -187,13 +187,23 @@ class Database:
                 LIMIT 10
             ''')
             
-            if not rows:
+            if not rows or len(rows) < 10:
                 return True
             
-            last_ranking = {row['app_id']: row['position'] for row in rows}
-            current_ranking = {app.app_id: app.position for app in rankings}
+            # Criar dict com app_id como string para garantir comparação correta
+            last_ranking = {str(row['app_id']): row['position'] for row in rows}
+            current_ranking = {str(app.app_id): app.position for app in rankings}
             
-            return last_ranking != current_ranking
+            # Comparar apenas se temos os mesmos apps
+            if set(last_ranking.keys()) != set(current_ranking.keys()):
+                return True
+            
+            # Comparar posições
+            for app_id, position in current_ranking.items():
+                if last_ranking.get(app_id) != position:
+                    return True
+            
+            return False
 
 
 # ============== POLYMARKET API ==============
