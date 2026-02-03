@@ -29,7 +29,9 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 TOP_APPS_LIMIT = int(os.getenv("TOP_APPS_LIMIT", "10"))
 POSITION_CHANGE_THRESHOLD = int(os.getenv("POSITION_CHANGE_THRESHOLD", "3"))
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "21600"))
-PRICE_CHANGE_THRESHOLD = float(os.getenv("PRICE_CHANGE_THRESHOLD", "0.01"))  # 1 centavo
+PRICE_CHANGE_THRESHOLD = float(os.getenv("PRICE_CHANGE_THRESHOLD", "0.01"))  # 1 centavo para salvar no banco
+ODDS_ALERT_PERCENT = float(os.getenv("ODDS_ALERT_PERCENT", "0.05"))  # 5% para alertar
+ODDS_ALERT_MIN_CHANGE = float(os.getenv("ODDS_ALERT_MIN_CHANGE", "0.01"))  # mínimo 1 centavo para alertar
 
 # ============== ESTRUTURAS DE DADOS ==============
 @dataclass
@@ -57,6 +59,14 @@ class MarketOdds:
     no_price: float
     volume_24h: float = 0.0
     timestamp: datetime = field(default_factory=datetime.now)
+
+@dataclass
+class OddsChange:
+    app_name: str
+    old_price: float
+    new_price: float
+    change_cents: float
+    change_percent: float
 
 # ============== DATABASE ==============
 class Database:
@@ -141,10 +151,12 @@ class Database:
                     VALUES ($1, $2, $3, $4)
                 ''', app.app_id, app.name, app.position, app.developer)
     
-    async def save_odds(self, market_type: str, odds_list: list[MarketOdds], market_date: datetime):
-        """Salva odds se houver mudança significativa"""
+    async def save_odds(self, market_type: str, odds_list: list[MarketOdds], market_date: datetime) -> list[OddsChange]:
+        """Salva odds se houver mudança e retorna mudanças significativas para alerta"""
+        changes = []
+        
         if not self.pool:
-            return
+            return changes
         
         async with self.pool.acquire() as conn:
             for odds in odds_list:
@@ -155,12 +167,30 @@ class Database:
                     ORDER BY timestamp DESC LIMIT 1
                 ''', market_type, odds.app_name)
                 
-                # Salvar só se mudou mais que o threshold
-                if not last or abs(float(last['yes_price']) - odds.yes_price) >= PRICE_CHANGE_THRESHOLD:
+                old_price = float(last['yes_price']) if last else None
+                
+                # Salvar só se mudou mais que o threshold (1¢)
+                if not last or abs(old_price - odds.yes_price) >= PRICE_CHANGE_THRESHOLD:
                     await conn.execute('''
                         INSERT INTO odds_history (market_type, app_name, yes_price, no_price, volume_24h, market_date)
                         VALUES ($1, $2, $3, $4, $5, $6)
                     ''', market_type, odds.app_name, odds.yes_price, odds.no_price, odds.volume_24h, market_date.date())
+                
+                # Verificar se deve alertar (5% E mínimo 1¢)
+                if old_price and old_price > 0:
+                    change_cents = odds.yes_price - old_price
+                    change_percent = change_cents / old_price
+                    
+                    if abs(change_percent) >= ODDS_ALERT_PERCENT and abs(change_cents) >= ODDS_ALERT_MIN_CHANGE:
+                        changes.append(OddsChange(
+                            app_name=odds.app_name,
+                            old_price=old_price,
+                            new_price=odds.yes_price,
+                            change_cents=change_cents,
+                            change_percent=change_percent
+                        ))
+        
+        return changes
     
     async def save_alert(self, alert_type: str, app_name: str, details: dict):
         """Salva log de alerta"""
@@ -611,13 +641,44 @@ class TelegramBot:
         message = "\n".join(lines)
         await self.send_message(message)
     
+    async def send_odds_alert(self, odds_changes: list[OddsChange], current_odds: list[MarketOdds] = None):
+        """Envia alerta quando odds mudam significativamente"""
+        CHART = "📈"
+        DOWN = "📉"
+        ALERT = "💰"
+        
+        lines = [f"{ALERT} <b>ALERTA - ODDS POLYMARKET</b> {ALERT}\n"]
+        
+        for change in odds_changes:
+            old_cents = int(change.old_price * 100)
+            new_cents = int(change.new_price * 100)
+            pct = change.change_percent * 100
+            
+            if change.change_cents > 0:
+                emoji = CHART
+                direction = "subiu"
+            else:
+                emoji = DOWN
+                direction = "caiu"
+            
+            lines.append(f"{emoji} <b>{change.app_name}</b> {direction} {abs(pct):.1f}% ({old_cents}¢ → {new_cents}¢)")
+        
+        if current_odds:
+            lines.append(self._build_odds_section(current_odds))
+        
+        lines.append(f"\n{self._build_market_links()}")
+        lines.append(f"\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        message = "\n".join(lines)
+        await self.send_message(message)
+    
     async def send_startup_message(self, top_apps: list[AppRanking], odds_list: list[MarketOdds] = None):
         lines = [
             "🤖 <b>Bot iniciado com sucesso!</b>\n",
             f"📊 Monitorando top {len(top_apps)} apps gratuitos",
             f"⏱ Intervalo de checagem: {CHECK_INTERVAL}s",
             f"💓 Heartbeat a cada {HEARTBEAT_INTERVAL // 3600}h",
-            f"📈 Alertas: líder, top 3, subida de {POSITION_CHANGE_THRESHOLD}+ posições",
+            f"📈 Alertas: líder, top 3, subida de {POSITION_CHANGE_THRESHOLD}+ posições, odds ±5%",
             f"🗄️ Salvando histórico no PostgreSQL\n",
             self._build_top5(top_apps),
         ]
@@ -728,7 +789,7 @@ class PolymarketMonitor:
                 await asyncio.sleep(60)
     
     async def check_once(self):
-        logger.info("Verificando ranking...")
+        logger.info("Verificando ranking e odds...")
         self.checks_count += 1
         
         rankings = await self.scraper.fetch_top_free_apps()
@@ -737,27 +798,29 @@ class PolymarketMonitor:
             return
         
         self.last_successful_rankings = rankings
-        changes = self.detector.detect_changes(rankings)
+        ranking_changes = self.detector.detect_changes(rankings)
         
-        # Salvar no banco se mudou
+        # Salvar ranking no banco se mudou
         if await self.db.should_save_ranking(rankings):
             await self.db.save_ranking(rankings)
             logger.info("Ranking salvo no banco")
         
-        # Buscar odds se houver mudanças
-        odds = []
-        if changes:
-            odds = await self.polymarket.fetch_market_odds(1)
+        # Buscar odds a cada check
+        odds = await self.polymarket.fetch_market_odds(1)
+        odds_changes = []
+        if odds:
             self.last_odds = odds
-            if odds:
-                await self.db.save_odds("#1", odds, self.polymarket.get_market_date())
+            odds_changes = await self.db.save_odds("#1", odds, self.polymarket.get_market_date())
+            if odds_changes:
+                logger.info(f"Detectadas {len(odds_changes)} mudanças significativas nas odds!")
         
-        if changes:
+        # Alertar mudanças no ranking
+        if ranking_changes:
             self.alerts_count += 1
-            logger.info(f"Detectadas {len(changes)} mudanças significativas!")
+            logger.info(f"Detectadas {len(ranking_changes)} mudanças significativas no ranking!")
             
             # Salvar alerta no banco
-            for change in changes:
+            for change in ranking_changes:
                 await self.db.save_alert(
                     "ranking_change",
                     change.app_name,
@@ -769,8 +832,28 @@ class PolymarketMonitor:
                     }
                 )
             
-            await self.bot.send_alert(changes, rankings, odds)
-        else:
+            await self.bot.send_alert(ranking_changes, rankings, odds)
+        
+        # Alertar mudanças nas odds (separado do ranking)
+        if odds_changes:
+            self.alerts_count += 1
+            
+            # Salvar alerta no banco
+            for change in odds_changes:
+                await self.db.save_alert(
+                    "odds_change",
+                    change.app_name,
+                    {
+                        "old_price": change.old_price,
+                        "new_price": change.new_price,
+                        "change_cents": change.change_cents,
+                        "change_percent": change.change_percent
+                    }
+                )
+            
+            await self.bot.send_odds_alert(odds_changes, odds)
+        
+        if not ranking_changes and not odds_changes:
             logger.info(f"Nenhuma mudança significativa. Líder atual: {rankings[0].name}")
     
     async def send_heartbeat(self):
