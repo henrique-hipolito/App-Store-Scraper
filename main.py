@@ -206,34 +206,43 @@ class Database:
     async def should_save_ranking(self, rankings: list[AppRanking]) -> bool:
         """Verifica se deve salvar ranking (só se mudou)"""
         if not self.pool:
+            logger.debug("Pool não disponível, salvando ranking")
             return True
         
         async with self.pool.acquire() as conn:
-            # Pegar último ranking (todos os registros do último minuto)
+            # Pegar último ranking salvo
             rows = await conn.fetch('''
-                SELECT app_id, position FROM ranking_history 
-                WHERE timestamp > NOW() - INTERVAL '2 minutes'
-                ORDER BY timestamp DESC
-                LIMIT 10
+                SELECT DISTINCT ON (app_id) app_id, position 
+                FROM ranking_history 
+                ORDER BY app_id, timestamp DESC
             ''')
             
-            if not rows or len(rows) < 10:
+            if not rows:
+                logger.info("Nenhum ranking anterior, salvando baseline")
                 return True
             
             # Criar dict com app_id como string para garantir comparação correta
             last_ranking = {str(row['app_id']): row['position'] for row in rows}
             current_ranking = {str(app.app_id): app.position for app in rankings}
             
-            # Comparar apenas se temos os mesmos apps
-            if set(last_ranking.keys()) != set(current_ranking.keys()):
-                return True
-            
-            # Comparar posições
+            # Verificar se mudou
+            changed = False
             for app_id, position in current_ranking.items():
-                if last_ranking.get(app_id) != position:
-                    return True
+                old_position = last_ranking.get(app_id)
+                if old_position != position:
+                    logger.info(f"Mudança detectada: {app_id} era #{old_position}, agora #{position}")
+                    changed = True
             
-            return False
+            # Verificar apps novos
+            new_apps = set(current_ranking.keys()) - set(last_ranking.keys())
+            if new_apps:
+                logger.info(f"Novos apps detectados: {new_apps}")
+                changed = True
+            
+            if not changed:
+                logger.debug("Ranking não mudou, não salvando")
+            
+            return changed
 
 
 # ============== POLYMARKET API ==============
