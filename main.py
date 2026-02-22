@@ -7,6 +7,7 @@ import asyncio
 import aiohttp
 import json
 import os
+import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
@@ -28,9 +29,9 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres1:abcd1234@ws_postg
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 TOP_APPS_LIMIT = int(os.getenv("TOP_APPS_LIMIT", "10"))
 POSITION_CHANGE_THRESHOLD = int(os.getenv("POSITION_CHANGE_THRESHOLD", "3"))
-HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "43200"))
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "21600"))
 PRICE_CHANGE_THRESHOLD = float(os.getenv("PRICE_CHANGE_THRESHOLD", "0.01"))  # 1 centavo para salvar no banco
-ODDS_ALERT_PERCENT = float(os.getenv("ODDS_ALERT_PERCENT", "9999"))  # 5% para alertar
+ODDS_ALERT_PERCENT = float(os.getenv("ODDS_ALERT_PERCENT", "0.05"))  # 5% para alertar
 ODDS_ALERT_MIN_CHANGE = float(os.getenv("ODDS_ALERT_MIN_CHANGE", "0.01"))  # mínimo 1 centavo para alertar
 
 # ============== ESTRUTURAS DE DADOS ==============
@@ -98,11 +99,12 @@ class Database:
             return
         
         async with self.pool.acquire() as conn:
-            # Tabela de histórico de ranking
+            # Tabela de histórico de ranking (adiciona snapshot_group_id)
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS ranking_history (
                     id SERIAL PRIMARY KEY,
                     timestamp TIMESTAMPTZ DEFAULT NOW(),
+                    snapshot_group_id UUID,
                     app_id VARCHAR(50),
                     app_name VARCHAR(255),
                     position INTEGER,
@@ -110,11 +112,45 @@ class Database:
                 )
             ''')
             
-            # Tabela de histórico de odds do Polymarket
+            # Adicionar coluna snapshot_group_id se não existir (para tabelas existentes)
+            await conn.execute('''
+                DO $$ 
+                BEGIN 
+                    ALTER TABLE ranking_history ADD COLUMN IF NOT EXISTS snapshot_group_id UUID;
+                EXCEPTION WHEN duplicate_column THEN NULL;
+                END $$;
+            ''')
+            
+            # Tabela de histórico de odds do Polymarket #1
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS odds_history (
                     id SERIAL PRIMARY KEY,
                     timestamp TIMESTAMPTZ DEFAULT NOW(),
+                    snapshot_group_id UUID,
+                    market_type VARCHAR(50),
+                    app_name VARCHAR(255),
+                    yes_price DECIMAL(5,4),
+                    no_price DECIMAL(5,4),
+                    volume_24h DECIMAL(15,2),
+                    market_date DATE
+                )
+            ''')
+            
+            # Adicionar coluna snapshot_group_id se não existir (para tabelas existentes)
+            await conn.execute('''
+                DO $$ 
+                BEGIN 
+                    ALTER TABLE odds_history ADD COLUMN IF NOT EXISTS snapshot_group_id UUID;
+                EXCEPTION WHEN duplicate_column THEN NULL;
+                END $$;
+            ''')
+            
+            # Tabela de histórico de odds do Polymarket #2 (novo!)
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS odds_history_2 (
+                    id SERIAL PRIMARY KEY,
+                    timestamp TIMESTAMPTZ DEFAULT NOW(),
+                    snapshot_group_id UUID,
                     market_type VARCHAR(50),
                     app_name VARCHAR(255),
                     yes_price DECIMAL(5,4),
@@ -135,28 +171,47 @@ class Database:
                 )
             ''')
             
-            # Índices
+            # Índices básicos
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_ranking_timestamp ON ranking_history(timestamp)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_odds_timestamp ON odds_history(timestamp)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_odds2_timestamp ON odds_history_2(timestamp)')
+            
+            # Índices compostos para melhor performance em queries de análise
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_ranking_app_time ON ranking_history(app_name, timestamp)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_odds_app_time ON odds_history(app_name, timestamp)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_odds2_app_time ON odds_history_2(app_name, timestamp)')
+            
+            # Índices para snapshot_group_id
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_ranking_snapshot ON ranking_history(snapshot_group_id)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_odds_snapshot ON odds_history(snapshot_group_id)')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_odds2_snapshot ON odds_history_2(snapshot_group_id)')
     
-    async def save_ranking(self, rankings: list[AppRanking]):
-        """Salva ranking atual se houver mudança"""
+    async def save_ranking(self, rankings: list[AppRanking], snapshot_group_id: str = None):
+        """Salva ranking atual com snapshot_group_id"""
         if not self.pool:
             return
+        
+        # Gerar snapshot_group_id se não fornecido
+        if not snapshot_group_id:
+            snapshot_group_id = str(uuid.uuid4())
         
         async with self.pool.acquire() as conn:
             for app in rankings:
                 await conn.execute('''
-                    INSERT INTO ranking_history (app_id, app_name, position, developer)
-                    VALUES ($1, $2, $3, $4)
-                ''', app.app_id, app.name, app.position, app.developer)
+                    INSERT INTO ranking_history (snapshot_group_id, app_id, app_name, position, developer)
+                    VALUES ($1, $2, $3, $4, $5)
+                ''', snapshot_group_id, app.app_id, app.name, app.position, app.developer)
     
-    async def save_odds(self, market_type: str, odds_list: list[MarketOdds], market_date: datetime) -> list[OddsChange]:
-        """Salva odds se houver mudança e retorna mudanças significativas para alerta"""
+    async def save_odds(self, market_type: str, odds_list: list[MarketOdds], market_date: datetime, snapshot_group_id: str = None) -> list[OddsChange]:
+        """Salva odds do mercado #1 se houver mudança e retorna mudanças significativas para alerta"""
         changes = []
         
         if not self.pool:
             return changes
+        
+        # Gerar snapshot_group_id se não fornecido
+        if not snapshot_group_id:
+            snapshot_group_id = str(uuid.uuid4())
         
         async with self.pool.acquire() as conn:
             for odds in odds_list:
@@ -172,9 +227,54 @@ class Database:
                 # Salvar só se mudou mais que o threshold (1¢)
                 if not last or abs(old_price - odds.yes_price) >= PRICE_CHANGE_THRESHOLD:
                     await conn.execute('''
-                        INSERT INTO odds_history (market_type, app_name, yes_price, no_price, volume_24h, market_date)
-                        VALUES ($1, $2, $3, $4, $5, $6)
-                    ''', market_type, odds.app_name, odds.yes_price, odds.no_price, odds.volume_24h, market_date.date())
+                        INSERT INTO odds_history (snapshot_group_id, market_type, app_name, yes_price, no_price, volume_24h, market_date)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ''', snapshot_group_id, market_type, odds.app_name, odds.yes_price, odds.no_price, odds.volume_24h, market_date.date())
+                
+                # Verificar se deve alertar (5% E mínimo 1¢)
+                if old_price and old_price > 0:
+                    change_cents = odds.yes_price - old_price
+                    change_percent = change_cents / old_price
+                    
+                    if abs(change_percent) >= ODDS_ALERT_PERCENT and abs(change_cents) >= ODDS_ALERT_MIN_CHANGE:
+                        changes.append(OddsChange(
+                            app_name=odds.app_name,
+                            old_price=old_price,
+                            new_price=odds.yes_price,
+                            change_cents=change_cents,
+                            change_percent=change_percent
+                        ))
+        
+        return changes
+    
+    async def save_odds_2(self, market_type: str, odds_list: list[MarketOdds], market_date: datetime, snapshot_group_id: str = None) -> list[OddsChange]:
+        """Salva odds do mercado #2 se houver mudança e retorna mudanças significativas para alerta"""
+        changes = []
+        
+        if not self.pool:
+            return changes
+        
+        # Gerar snapshot_group_id se não fornecido
+        if not snapshot_group_id:
+            snapshot_group_id = str(uuid.uuid4())
+        
+        async with self.pool.acquire() as conn:
+            for odds in odds_list:
+                # Verificar último registro
+                last = await conn.fetchrow('''
+                    SELECT yes_price FROM odds_history_2 
+                    WHERE market_type = $1 AND app_name = $2 
+                    ORDER BY timestamp DESC LIMIT 1
+                ''', market_type, odds.app_name)
+                
+                old_price = float(last['yes_price']) if last else None
+                
+                # Salvar só se mudou mais que o threshold (1¢)
+                if not last or abs(old_price - odds.yes_price) >= PRICE_CHANGE_THRESHOLD:
+                    await conn.execute('''
+                        INSERT INTO odds_history_2 (snapshot_group_id, market_type, app_name, yes_price, no_price, volume_24h, market_date)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ''', snapshot_group_id, market_type, odds.app_name, odds.yes_price, odds.no_price, odds.volume_24h, market_date.date())
                 
                 # Verificar se deve alertar (5% E mínimo 1¢)
                 if old_price and old_price > 0:
@@ -745,20 +845,26 @@ class PolymarketMonitor:
         
         # Primeira execução
         try:
+            # Gerar snapshot_group_id único para inicialização
+            snapshot_id = str(uuid.uuid4())
+            
             rankings = await self.scraper.fetch_top_free_apps()
-            odds = await self.polymarket.fetch_market_odds(1)
+            odds_1 = await self.polymarket.fetch_market_odds(1)
+            odds_2 = await self.polymarket.fetch_market_odds(2)
             
             if rankings:
                 self.last_successful_rankings = rankings
-                self.last_odds = odds
-                await self.bot.send_startup_message(rankings, odds)
+                self.last_odds = odds_1
+                await self.bot.send_startup_message(rankings, odds_1)
                 self.detector.detect_changes(rankings)
                 
                 # Salvar no banco
                 if await self.db.should_save_ranking(rankings):
-                    await self.db.save_ranking(rankings)
-                if odds:
-                    await self.db.save_odds("#1", odds, self.polymarket.get_market_date())
+                    await self.db.save_ranking(rankings, snapshot_id)
+                if odds_1:
+                    await self.db.save_odds("#1", odds_1, self.polymarket.get_market_date(), snapshot_id)
+                if odds_2:
+                    await self.db.save_odds_2("#2", odds_2, self.polymarket.get_market_date(), snapshot_id)
             else:
                 logger.error("Não foi possível obter rankings iniciais")
                 return
@@ -801,6 +907,9 @@ class PolymarketMonitor:
         logger.info("Verificando ranking e odds...")
         self.checks_count += 1
         
+        # Gerar snapshot_group_id único para este check
+        snapshot_id = str(uuid.uuid4())
+        
         rankings = await self.scraper.fetch_top_free_apps()
         if not rankings:
             logger.warning("Nenhum ranking obtido")
@@ -811,17 +920,25 @@ class PolymarketMonitor:
         
         # Salvar ranking no banco se mudou
         if await self.db.should_save_ranking(rankings):
-            await self.db.save_ranking(rankings)
+            await self.db.save_ranking(rankings, snapshot_id)
             logger.info("Ranking salvo no banco")
         
-        # Buscar odds a cada check
-        odds = await self.polymarket.fetch_market_odds(1)
-        odds_changes = []
-        if odds:
-            self.last_odds = odds
-            odds_changes = await self.db.save_odds("#1", odds, self.polymarket.get_market_date())
-            if odds_changes:
-                logger.info(f"Detectadas {len(odds_changes)} mudanças significativas nas odds!")
+        # Buscar odds do mercado #1 a cada check
+        odds_1 = await self.polymarket.fetch_market_odds(1)
+        odds_changes_1 = []
+        if odds_1:
+            self.last_odds = odds_1
+            odds_changes_1 = await self.db.save_odds("#1", odds_1, self.polymarket.get_market_date(), snapshot_id)
+            if odds_changes_1:
+                logger.info(f"Detectadas {len(odds_changes_1)} mudanças significativas nas odds #1!")
+        
+        # Buscar odds do mercado #2 a cada check
+        odds_2 = await self.polymarket.fetch_market_odds(2)
+        odds_changes_2 = []
+        if odds_2:
+            odds_changes_2 = await self.db.save_odds_2("#2", odds_2, self.polymarket.get_market_date(), snapshot_id)
+            if odds_changes_2:
+                logger.info(f"Detectadas {len(odds_changes_2)} mudanças significativas nas odds #2!")
         
         # Alertar mudanças no ranking
         if ranking_changes:
@@ -841,16 +958,16 @@ class PolymarketMonitor:
                     }
                 )
             
-            await self.bot.send_alert(ranking_changes, rankings, odds)
+            await self.bot.send_alert(ranking_changes, rankings, odds_1)
         
-        # Alertar mudanças nas odds (separado do ranking)
-        if odds_changes:
+        # Alertar mudanças nas odds #1 (separado do ranking)
+        if odds_changes_1:
             self.alerts_count += 1
             
             # Salvar alerta no banco
-            for change in odds_changes:
+            for change in odds_changes_1:
                 await self.db.save_alert(
-                    "odds_change",
+                    "odds_change_1",
                     change.app_name,
                     {
                         "old_price": change.old_price,
@@ -860,9 +977,28 @@ class PolymarketMonitor:
                     }
                 )
             
-            await self.bot.send_odds_alert(odds_changes, odds)
+            await self.bot.send_odds_alert(odds_changes_1, odds_1)
         
-        if not ranking_changes and not odds_changes:
+        # Alertar mudanças nas odds #2 (separado)
+        if odds_changes_2:
+            self.alerts_count += 1
+            
+            # Salvar alerta no banco
+            for change in odds_changes_2:
+                await self.db.save_alert(
+                    "odds_change_2",
+                    change.app_name,
+                    {
+                        "old_price": change.old_price,
+                        "new_price": change.new_price,
+                        "change_cents": change.change_cents,
+                        "change_percent": change.change_percent
+                    }
+                )
+            
+            await self.bot.send_odds_alert(odds_changes_2, odds_2)
+        
+        if not ranking_changes and not odds_changes_1 and not odds_changes_2:
             logger.info(f"Nenhuma mudança significativa. Líder atual: {rankings[0].name}")
     
     async def send_heartbeat(self):
@@ -870,13 +1006,21 @@ class PolymarketMonitor:
         rankings = self.last_successful_rankings
         
         if rankings:
-            # Buscar odds atualizadas
-            odds = await self.polymarket.fetch_market_odds(1)
-            if odds:
-                self.last_odds = odds
-                await self.db.save_odds("#1", odds, self.polymarket.get_market_date())
+            # Gerar snapshot_group_id único para este heartbeat
+            snapshot_id = str(uuid.uuid4())
             
-            await self.bot.send_heartbeat(rankings, uptime_hours, self.checks_count, self.alerts_count, odds)
+            # Buscar odds atualizadas do mercado #1
+            odds_1 = await self.polymarket.fetch_market_odds(1)
+            if odds_1:
+                self.last_odds = odds_1
+                await self.db.save_odds("#1", odds_1, self.polymarket.get_market_date(), snapshot_id)
+            
+            # Buscar odds atualizadas do mercado #2
+            odds_2 = await self.polymarket.fetch_market_odds(2)
+            if odds_2:
+                await self.db.save_odds_2("#2", odds_2, self.polymarket.get_market_date(), snapshot_id)
+            
+            await self.bot.send_heartbeat(rankings, uptime_hours, self.checks_count, self.alerts_count, odds_1)
             logger.info("Heartbeat enviado")
         else:
             logger.warning("Sem rankings para heartbeat")
