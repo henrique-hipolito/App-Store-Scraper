@@ -31,7 +31,7 @@ TOP_APPS_LIMIT = int(os.getenv("TOP_APPS_LIMIT", "10"))
 POSITION_CHANGE_THRESHOLD = int(os.getenv("POSITION_CHANGE_THRESHOLD", "3"))
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "21600"))
 PRICE_CHANGE_THRESHOLD = float(os.getenv("PRICE_CHANGE_THRESHOLD", "0.01"))  # 1 centavo para salvar no banco
-ODDS_ALERT_PERCENT = float(os.getenv("ODDS_ALERT_PERCENT", "0.05"))  # 5% para alertar
+ODDS_ALERT_PERCENT = float(os.getenv("ODDS_ALERT_PERCENT", "9999"))  # 9999% para alertar
 ODDS_ALERT_MIN_CHANGE = float(os.getenv("ODDS_ALERT_MIN_CHANGE", "0.01"))  # mínimo 1 centavo para alertar
 
 # ============== ESTRUTURAS DE DADOS ==============
