@@ -5,6 +5,8 @@ Monitora o ranking da App Store e odds do Polymarket, grava histórico e envia a
 
 import asyncio
 import aiohttp
+import csv
+import io
 import json
 import os
 import uuid
@@ -343,6 +345,42 @@ class Database:
                 logger.debug("Ranking não mudou, não salvando")
             
             return changed
+    
+    async def export_table_csv(self, table: str, today_only: bool = False) -> tuple:
+        """Exporta uma tabela como CSV em memória. Retorna (filename, buffer)."""
+        if not self.pool:
+            return None, None
+        
+        suffix = "_hoje" if today_only else "_completo"
+        filename = f"{table}{suffix}.csv"
+        
+        async with self.pool.acquire() as conn:
+            if today_only:
+                rows = await conn.fetch(
+                    f"SELECT * FROM {table} WHERE timestamp::date = CURRENT_DATE ORDER BY timestamp"
+                )
+            else:
+                rows = await conn.fetch(f"SELECT * FROM {table} ORDER BY timestamp")
+        
+        buf = io.StringIO()
+        if rows:
+            writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(dict(row))
+        
+        buf.seek(0)
+        return filename, buf
+    
+    async def export_all_csv(self, today_only: bool = False) -> list:
+        """Exporta as 4 tabelas. Retorna lista de (filename, buffer)."""
+        tables = ["ranking_history", "odds_history", "odds_history_2", "alerts_log"]
+        results = []
+        for table in tables:
+            filename, buf = await self.export_table_csv(table, today_only=today_only)
+            if filename:
+                results.append((filename, buf))
+        return results
 
 
 # ============== POLYMARKET API ==============
@@ -644,12 +682,15 @@ class ChangeDetector:
 # ============== BOT DO TELEGRAM ==============
 class TelegramBot:
     API_URL = "https://api.telegram.org/bot{token}/sendMessage"
+    API_DOC_URL = "https://api.telegram.org/bot{token}/sendDocument"
+    API_UPDATES_URL = "https://api.telegram.org/bot{token}/getUpdates"
     
     def __init__(self, token: str, chat_id: str, polymarket: PolymarketAPI):
         self.token = token
         self.chat_id = chat_id
         self.polymarket = polymarket
         self.session: Optional[aiohttp.ClientSession] = None
+        self._last_update_id: int = 0
     
     async def get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
@@ -659,6 +700,61 @@ class TelegramBot:
     async def close(self):
         if self.session and not self.session.closed:
             await self.session.close()
+    
+    async def send_document(self, filename: str, buf: "io.StringIO", caption: str = "") -> bool:
+        """Envia um arquivo CSV para o chat."""
+        session = await self.get_session()
+        url = self.API_DOC_URL.format(token=self.token)
+        
+        data = aiohttp.FormData()
+        data.add_field("chat_id", self.chat_id)
+        data.add_field("document", buf.read().encode("utf-8"),
+                       filename=filename, content_type="text/csv")
+        if caption:
+            data.add_field("caption", caption)
+        
+        try:
+            async with session.post(url, data=data) as response:
+                if response.status == 200:
+                    logger.info(f"Documento {filename} enviado")
+                    return True
+                else:
+                    error = await response.text()
+                    logger.error(f"Erro ao enviar documento {filename}: {error}")
+                    return False
+        except Exception as e:
+            logger.error(f"Exceção ao enviar documento {filename}: {e}")
+            return False
+    
+    async def send_export(self, db: "Database", today_only: bool = False):
+        """Exporta e envia as 4 tabelas como CSVs."""
+        label = "hoje" if today_only else "completo"
+        await self.send_message(f"📦 Exportando banco de dados ({label})...")
+        files = await db.export_all_csv(today_only=today_only)
+        if not files:
+            await self.send_message("⚠️ Nenhum dado encontrado para exportar.")
+            return
+        for filename, buf in files:
+            await self.send_document(filename, buf, caption=filename)
+        await self.send_message(f"✅ Export {label} concluído — {len(files)} arquivo(s) enviado(s).")
+    
+    async def get_updates(self) -> list:
+        """Busca novas mensagens via long polling (timeout 0 = non-blocking)."""
+        session = await self.get_session()
+        url = self.API_UPDATES_URL.format(token=self.token)
+        params = {"offset": self._last_update_id + 1, "timeout": 0, "limit": 10}
+        
+        try:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    updates = data.get("result", [])
+                    if updates:
+                        self._last_update_id = updates[-1]["update_id"]
+                    return updates
+        except Exception as e:
+            logger.debug(f"Erro ao buscar updates: {e}")
+        return []
     
     async def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
         session = await self.get_session()
@@ -865,6 +961,9 @@ class PolymarketMonitor:
                     await self.db.save_odds("#1", odds_1, self.polymarket.get_market_date(), snapshot_id)
                 if odds_2:
                     await self.db.save_odds_2("#2", odds_2, self.polymarket.get_market_date(), snapshot_id)
+                
+                # Export automático no startup
+                await self.bot.send_export(self.db, today_only=False)
             else:
                 logger.error("Não foi possível obter rankings iniciais")
                 return
@@ -875,6 +974,7 @@ class PolymarketMonitor:
         await asyncio.gather(
             self._check_loop(),
             self._heartbeat_loop(),
+            self._command_loop(),
         )
         
         await self.cleanup()
@@ -902,6 +1002,66 @@ class PolymarketMonitor:
             except Exception as e:
                 logger.error(f"Erro no heartbeat: {e}")
                 await asyncio.sleep(60)
+    
+    async def _command_loop(self):
+        """Polling de comandos Telegram a cada 5 segundos."""
+        logger.info("Command loop iniciado")
+        while self.running:
+            try:
+                updates = await self.bot.get_updates()
+                for update in updates:
+                    msg = update.get("message") or update.get("edited_message")
+                    if not msg:
+                        continue
+                    chat_id = str(msg.get("chat", {}).get("id", ""))
+                    if chat_id != str(self.bot.chat_id):
+                        continue  # ignora outros usuários
+                    text = msg.get("text", "").strip().lower().split("@")[0]
+                    await self._handle_command(text)
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                logger.info("Command loop cancelado")
+                break
+            except Exception as e:
+                logger.error(f"Erro no command loop: {e}")
+                await asyncio.sleep(10)
+    
+    async def _handle_command(self, text: str):
+        """Processa um comando recebido."""
+        if text == "/export_full":
+            await self.bot.send_export(self.db, today_only=False)
+        
+        elif text == "/export_hoje":
+            await self.bot.send_export(self.db, today_only=True)
+        
+        elif text == "/status":
+            uptime_hours = (datetime.now() - self.start_time).total_seconds() / 3600 if self.start_time else 0
+            rankings = self.last_successful_rankings
+            leader = rankings[0].name if rankings else "N/A"
+            odds_str = ""
+            if self.last_odds:
+                top_odds = sorted(self.last_odds, key=lambda x: x.yes_price, reverse=True)[:3]
+                odds_str = "\n💰 Odds top 3: " + ", ".join(f"{o.app_name} {int(o.yes_price*100)}¢" for o in top_odds)
+            msg = (
+                f"⚡ <b>STATUS DO BOT</b>\n\n"
+                f"⏱ Uptime: {uptime_hours:.1f}h\n"
+                f"🔄 Verificações: {self.checks_count}\n"
+                f"🚨 Alertas enviados: {self.alerts_count}\n"
+                f"👑 Líder atual: {leader}"
+                f"{odds_str}\n"
+                f"\n⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            await self.bot.send_message(msg)
+        
+        elif text == "/help":
+            msg = (
+                "🤖 <b>Comandos disponíveis:</b>\n\n"
+                "/export_full — banco completo (4 CSVs)\n"
+                "/export_hoje — dados do dia atual\n"
+                "/status — snapshot rápido do estado\n"
+                "/help — esta mensagem"
+            )
+            await self.bot.send_message(msg)
     
     async def check_once(self):
         logger.info("Verificando ranking e odds...")
